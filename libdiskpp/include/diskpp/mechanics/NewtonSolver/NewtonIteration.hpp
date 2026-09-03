@@ -86,15 +86,18 @@ class NewtonIteration : public GenericIteration< MeshType > {
 
         // Like if it is an implicit scheme
         auto current_time = this->m_time_step.end_time();
+        bnd.setContactTime( current_time );
         auto depl = fields.getCurrentField( FieldName::DEPL );
         auto depl_faces = fields.getCurrentField( FieldName::DEPL_FACES );
 
         std::vector< vector_type > resi_cells;
 
         std::vector< vector_type > acce_cells;
+        std::vector< vector_type > vite;
         if ( this->m_dyna.enable() ) {
             acce_cells = fields.getCurrentField( FieldName::ACCE_CELLS );
-            resi_cells.reserve( msh.cells_size() );
+            vite = fields.getCurrentField( FieldName::VITE );
+            resi_cells.resize( msh.cells_size() );
         }
 
         auto rlf = this->_getLoad( lf, current_time );
@@ -114,6 +117,11 @@ class NewtonIteration : public GenericIteration< MeshType > {
             const auto num_tot_dofs = huT.size();
             const auto num_faces_dofs = num_tot_dofs - num_cell_dofs;
 
+            vector_type hvT = vector_type::Zero( num_tot_dofs );
+            if ( this->m_dyna.enable() ) {
+                hvT = vite.at( cell_i );
+            }
+
             // Gradient Reconstruction
             // std::cout << "Grad" << std::endl;
             tc.tic();
@@ -126,8 +134,8 @@ class NewtonIteration : public GenericIteration< MeshType > {
 
             tc.tic();
             // std::cout << "Elem" << std::endl;
-            elem.compute( msh, cl, bnd, rp, degree_infos, rlf, GT, huT, this->m_time_step, behavior,
-                          stab_manager, small_def, true, use_tangent_modulus );
+            elem.compute( msh, cl, bnd, rp, degree_infos, rlf, GT, huT, hvT, this->m_time_step,
+                          behavior, stab_manager, small_def, true, use_tangent_modulus );
 
             matrix_type lhs = elem.K_int;
             vector_type rhs = elem.RTF;
@@ -185,7 +193,7 @@ class NewtonIteration : public GenericIteration< MeshType > {
                 this->m_AL[cell_i] = matrix_type::Zero( num_cell_dofs, num_faces_dofs );
                 this->m_bL[cell_i] = vector_type::Zero( num_cell_dofs );
 
-                resi_cells.push_back( rhs.head( num_cell_dofs ) );
+                resi_cells[cell_i] = rhs.head( num_cell_dofs );
 
                 tc.toc();
                 ai.m_time_statcond += tc.elapsed();

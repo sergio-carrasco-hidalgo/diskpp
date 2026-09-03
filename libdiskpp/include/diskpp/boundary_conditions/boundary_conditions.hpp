@@ -187,6 +187,7 @@ class BoundaryConditions {
     std::vector< std::function< scalar_type(
         point_type, static_vector< scalar_type, mesh_type::dimension > ) > >
         m_contact_gap;
+    mutable scalar_type m_contact_time = scalar_type(0);
 
     template < typename >
     inline static constexpr bool always_false_v = false;
@@ -285,6 +286,9 @@ class BoundaryConditions {
             m_contact_faces++;
         }
     }
+
+    void        setContactTime( scalar_type t ) const { m_contact_time = t; }
+    scalar_type getContactTime() const                { return m_contact_time; }
 
     template < typename Function >
     void addDirichletEverywhere( Function &&bcf ) {

@@ -61,6 +61,7 @@ enum NonLinearSolverType {
     QNEWTON_BDIAG_JACO,
     QNEWTON_BDIAG_STAB,
     QNEWTON_BDIAG_ELAS,
+    EXPLICIT,
 };
 
 enum LineSearchType {
@@ -210,6 +211,10 @@ std::string NonLinearSolverName( const NonLinearSolverType &type ) {
         return "QNEWTON_BDIAG_ELAS";
         break;
     }
+    case NonLinearSolverType::EXPLICIT: {
+        return "EXPLICIT";
+        break;
+    }
     default:
         break;
     }
@@ -295,11 +300,24 @@ class NonLinearParameters {
     std::map< std::string, T > m_dyna_para; // list of parameters
     T m_cfl_factor;                         // CFL factor
 
+    // Impose the contact condition on the cell trace (SIGNORINI_CELL) instead of the
+    // face unknowns (SIGNORINI_FACE).
+    bool m_contact_cell;
+
+
     int m_n_time_save;          // number of saving
     std::list< T > m_time_save; // list of time where we save result;
 
     T m_theta;                // theta-parameter for contact
     T m_gamma_0;              // parameter for Nitsche
+    // Tangential Nitsche penalty. Negative means 'not set': gamma_0_t() then falls
+    // back to m_gamma_0. The velocity-based friction law needs a much smaller value
+    // than the normal condition, so the two are separate.
+    T m_gamma_0_t = T( -1 );
+    // Regularisation of the sliding direction in the friction projection: x/|x| becomes
+    // x/sqrt(|x|^2 + eps^2). The exact direction flips sign whenever the sliding reverses.
+    // 0 = exact, non-smooth law.
+    T m_dproj_eps = T( 0 );
     T m_threshold;            // threshol for Tesca friction
     FrictionType m_frot_type; // Friction type ?
 
@@ -328,6 +346,7 @@ class NonLinearParameters {
           m_threshold( 0 ),
           m_frot_type( FrictionType::NO_FRICTION ),
           m_dyna_type( DynamicType::STATIC ),
+          m_contact_cell( false ),
           m_lin_solv( solvers::direct_solver::autosel ),
           m_nlin_solv( NonLinearSolverType::NEWTON ),
           m_lsearch( LineSearchType::NO_LS ),
@@ -362,9 +381,13 @@ class NonLinearParameters {
         std::cout << " - Precomputation: " << BoolName( m_precomputation ) << std::endl;
         std::cout << " - Dynamic scheme: " << DynaSchemeName( m_dyna_type ) << std::endl;
         std::cout << " - CFL factor: " << m_cfl_factor << std::endl;
+        std::cout << " - Contact type: " << ( m_contact_cell ? "SIGNORINI_CELL" : "SIGNORINI_FACE" )
+                  << std::endl;
         std::cout << " - Friction ?: " << FrictionName( m_frot_type ) << std::endl;
         std::cout << " - Threshold: " << m_threshold << std::endl;
         std::cout << " - Gamma_0: " << m_gamma_0 << std::endl;
+        std::cout << " - Gamma_0_t: " << gamma_0_t() << std::endl;
+        std::cout << " - SlipEps: " << m_dproj_eps << std::endl;
         std::cout << " - Theta: " << m_theta << std::endl;
     }
 
@@ -431,7 +454,17 @@ class NonLinearParameters {
                     m_time_save.push_back( time );
                     line++;
                 }
-            } else if ( keyword == "AdaptativeStabilization" ) {
+            } else if ( keyword == "ContactType" ) {
+                std::string type;
+                ifs >> type;
+                line++;
+                if ( type == "FACE" )
+                    m_contact_cell = false;
+                else if ( type == "CELL" )
+                    m_contact_cell = true;
+                else
+                    error_keyword( line, keyword, type );
+                        } else if ( keyword == "AdaptativeStabilization" ) {
                 std::string logical;
                 ifs >> logical;
                 line++;
@@ -454,7 +487,7 @@ class NonLinearParameters {
                 else if ( type == "NO" ) {
                     m_stab = false;
                     m_stab_type = StabilizationType::NO;
-                } else 
+                } else
                     error_keyword(line, keyword, type);
             } else if ( keyword == "Beta" ) {
                 ifs >> m_beta;
@@ -485,6 +518,12 @@ class NonLinearParameters {
             } else if ( keyword == "Gamma0" ) {
                 ifs >> m_gamma_0;
                 line++;
+            } else if ( keyword == "Gamma0T" ) {
+                ifs >> m_gamma_0_t;
+                line++;
+            } else if ( keyword == "SlipEps" ) {
+                ifs >> m_dproj_eps;
+                line++;
             } else if ( keyword == "Friction" ) {
                 std::string type;
                 ifs >> type;
@@ -495,7 +534,7 @@ class NonLinearParameters {
                     m_frot_type = FrictionType::TRESCA;
                 else if ( type == "COULOMB" )
                     m_frot_type = FrictionType::COULOMB;
-                else 
+                else
                     error_keyword(line, keyword, type);
             } else if ( keyword == "Threshold" ) {
                 ifs >> m_threshold;
@@ -515,7 +554,7 @@ class NonLinearParameters {
                     m_dyna_type = DynamicType::CRANK_NICOLSON;
                 else if ( type == "LEAP_FROG" )
                     m_dyna_type = DynamicType::LEAP_FROG;
-                else 
+                else
                     error_keyword(line, keyword, type);
             } else if ( keyword == "CFL" ) {
                 ifs >> m_cfl_factor;
@@ -534,6 +573,8 @@ class NonLinearParameters {
                     m_nlin_solv = NonLinearSolverType::QNEWTON_BDIAG_STAB;
                 } else if ( type == "QNEWTON_BDIAG_ELAS" ) {
                     m_nlin_solv = NonLinearSolverType::QNEWTON_BDIAG_ELAS;
+                } else if ( type == "EXPLICIT" ) {
+                    m_nlin_solv = NonLinearSolverType::EXPLICIT;
                 } else {
                     error_keyword(line, keyword, type);
                 }
@@ -607,6 +648,30 @@ class NonLinearParameters {
     void setUnsteadyScheme( const DynamicType &scheme ) { m_dyna_type = scheme; }
 
     auto getUnsteadyParameters() const { return m_dyna_para; }
+
+    // dv/du of the time integrator: every scheme writes v_{n+1} affinely in u_{n+1}.
+    // Tangential penalty; defaults to the normal one when Gamma0T is absent.
+    T gamma_0_t() const { return m_gamma_0_t > T( 0 ) ? m_gamma_0_t : m_gamma_0; }
+
+    T velocity_slope( const T dt ) const {
+        switch ( m_dyna_type ) {
+        case DynamicType::STATIC:
+            return T( 1 );
+        case DynamicType::NEWMARK:
+            // v = gamma*dt * a  and  a = u/(beta*dt^2)  ==>  gamma/(beta*dt)
+            return m_dyna_para.at( "gamma" ) / ( m_dyna_para.at( "beta" ) * dt );
+        case DynamicType::THETA:
+            // v = theta*dt * a  and  a = u/(theta^2*dt^2)  ==>  1/(theta*dt)
+            return T( 1 ) / ( m_dyna_para.at( "theta" ) * dt );
+        default:
+            // BACKWARD_EULER / CRANK_NICOLSON are rewritten as THETA before use, so this
+            // is the LEAP_FROG case.
+            return T( 1 ) / dt;
+        }
+    }
+
+    bool isContactCell() const { return m_contact_cell; }
+
 
     auto getCFLFactor() const { return m_cfl_factor; }
 

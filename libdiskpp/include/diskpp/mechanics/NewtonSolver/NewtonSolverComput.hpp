@@ -329,19 +329,46 @@ class mechanical_computation {
         time_fint += tc.elapsed();
     }
 
-    void compute_contact_terms( const mesh_type &msh, const cell_type &cl, const bnd_type &bnd,
-                                const param_type &rp, const CellDegreeInfo< mesh_type > &cell_infos,
-                                const matrix_type &RkT, const vector_type &uTF,
-                                const TimeStep< scalar_type > &time_step,
-                                behavior_type &behavior ) {
+    void
+    compute_contact_terms( const mesh_type &msh,
+                           const cell_type &cl,
+                           const bnd_type &bnd,
+                           const param_type &rp,
+                           const CellDegreeInfo< mesh_type > &cell_infos,
+                           const matrix_type &RkT,
+                           const vector_type &uTF,
+                           const vector_type &vTF,
+                           const TimeStep< scalar_type > &time_step,
+                           behavior_type &behavior,
+                           bool tangent_matix ) {
         if ( bnd.cell_has_contact_faces( cl ) ) {
             const auto &material_data = behavior.getMaterialData();
             auto cc = contact_contribution( msh, material_data, rp, bnd );
-            cc.compute( cl, cell_infos, RkT, uTF );
+
+            // Displacement-based friction: the law is written on u_t.
+            vector_type wTF = uTF;
+            scalar_type c_N = scalar_type( 1 );
+
+            // DISABLED. Velocity-based friction, Q_gamma^t(u,v) = sigma_nt(u) - gamma_F * v_t,
+            // with c_N = dv/du from the integrator. This is the correct dynamic law and both
+            // residual and tangent are verified (contact_jacobian_check gives ~1e-14 at
+            // c_N = 1.944 and 38.889), but Newton enters an active-set limit cycle at contact
+            // onset: the residual alternates between two fixed values with |du| frozen, for
+            // 198 iterations. Insensitive to gamma_0_t (0.3..1000), gamma_0_n (30..1000),
+            // dt (0.05, 0.01) and every LineSearch. Re-enable once the active set is held
+            // fixed within an iteration (semi-smooth Newton).
+            // if ( rp.isUnsteady() && vTF.size() == uTF.size() ) {
+            //     wTF = vTF;
+            //     c_N = rp.velocity_slope( time_step.increment_time() );
+            // }
+
+            cc.compute( cl, cell_infos, RkT, uTF, wTF, tangent_matix, c_N );
 
             time_contact += cc.time_contact;
 
-            K_int += cc.K_cont;
+            if ( tangent_matix ) {
+                K_int += cc.K_cont;
+            }
             F_int += cc.F_cont;
             RTF -= cc.F_cont;
         }
@@ -381,10 +408,10 @@ class mechanical_computation {
     void compute( const mesh_type &msh, const cell_type &cl, const bnd_type &bnd,
                   const param_type &rp, const MeshDegreeInfo< mesh_type > &degree_infos,
                   const std::unique_ptr< func_type > &load, const matrix_type &RkT,
-                  const vector_type &uTF, const TimeStep< scalar_type > &time_step,
-                  behavior_type &behavior, StabCoeffManager< scalar_type > &stab_manager,
-                  const bool small_def, const bool tangent_matix = true,
-                  const bool use_tangent_modulus = true ) {
+                  const vector_type &uTF, const vector_type &vTF,
+                  const TimeStep< scalar_type > &time_step, behavior_type &behavior,
+                  StabCoeffManager< scalar_type > &stab_manager, const bool small_def,
+                  const bool tangent_matix = true, const bool use_tangent_modulus = true ) {
         timecounter tc;
 
         const auto cell_infos = degree_infos.cellDegreeInfo( msh, cl );
@@ -533,6 +560,9 @@ class mechanical_computation {
             K_int = RkT.transpose() * AT * RkT;
             tc.toc();
             time_rigi += tc.elapsed();
+
+            assert( K_int.rows() == num_total_dofs );
+            assert( K_int.cols() == num_total_dofs );
         }
         tc.tic();
         F_int = RkT.transpose() * aT;
@@ -542,7 +572,8 @@ class mechanical_computation {
 
         // Compute contact terms
 
-        this->compute_contact_terms( msh, cl, bnd, rp, cell_infos, RkT, uTF, time_step, behavior );
+        this->compute_contact_terms(
+            msh, cl, bnd, rp, cell_infos, RkT, uTF, vTF, time_step, behavior, tangent_matix );
 
         // std::cout << "K: " << K_int.norm() << std::endl;
         // // std::cout << K_int << std::endl;
@@ -553,8 +584,6 @@ class mechanical_computation {
 
         // throw std::runtime_error("");
 
-        assert( K_int.rows() == num_total_dofs );
-        assert( K_int.cols() == num_total_dofs );
         assert( RTF.rows() == num_total_dofs );
     }
 

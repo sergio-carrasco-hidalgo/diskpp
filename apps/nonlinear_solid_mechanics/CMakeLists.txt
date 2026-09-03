@@ -26,6 +26,10 @@ add_executable(hyperelasticity_test src/hyperelasticity_test.cpp)
 target_link_libraries(hyperelasticity_test diskpp::diskpp)
 install(TARGETS hyperelasticity_test RUNTIME DESTINATION bin)
 
+add_executable(contact_jacobian_check src/contact_jacobian_check.cpp)
+target_link_libraries(contact_jacobian_check diskpp::diskpp)
+install(TARGETS contact_jacobian_check RUNTIME DESTINATION bin)
+
 option(OPT_NSM_USE_MUMPS "Use MUMPS for nonlinear solid mechanics" OFF)
 if (OPT_NSM_USE_MUMPS)
     target_compile_definitions(nonlinear_solid_mechanics PUBLIC -DNSM_USE_MUMPS)
@@ -33,6 +37,7 @@ if (OPT_NSM_USE_MUMPS)
     target_compile_definitions(elasticity_test PUBLIC -DNSM_USE_MUMPS)
     target_compile_definitions(elastodynamic_test PUBLIC -DNSM_USE_MUMPS)
     target_compile_definitions(hyperelasticity_test PUBLIC -DNSM_USE_MUMPS)
+    target_compile_definitions(contact_jacobian_check PUBLIC -DNSM_USE_MUMPS)
 endif()
 
 install(DIRECTORY share/ DESTINATION share)

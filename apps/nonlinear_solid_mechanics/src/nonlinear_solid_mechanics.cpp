@@ -47,7 +47,7 @@ void run_nl_solid_mechanics_solver( const Mesh< T, N, Storage > &msh,
     const auto material_data = getMaterialData< T >( study );
 
     /* Get boundary conditions */
-    const auto bnd = getBoundaryConditions( msh, material_data, study );
+    const auto bnd = getBoundaryConditions( msh, material_data, study, rp.m_threshold, rp.isContactCell() );
 
     /* Create nonlinear solver */
     disk::mechanics::NonLinearSolver< mesh_type > nl( msh, bnd, rp );
@@ -105,7 +105,7 @@ int main( int argc, char **argv ) {
     mesh_filename = argv[0];
 
     /* Define study parameters to use */
-    const STUDY study = STUDY::IMPACT_2D;
+    const STUDY study = STUDY::DYNAMIC_DISC_IMPACT;
 
     addAdditionalParameters( study, rp );
 

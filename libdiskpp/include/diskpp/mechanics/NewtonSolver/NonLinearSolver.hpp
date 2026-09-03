@@ -111,9 +111,9 @@ class NonLinearSolver {
                 const auto bfc = *itor;
                 const auto face_id = m_msh.lookup( bfc );
 
+                // Enrich every contact face (this loop used to break after the first).
                 if ( m_bnd.contact_boundary_type( face_id ) == SIGNORINI_FACE ) {
                     m_degree_infos.degree( m_msh, bfc, face_degree + 1 );
-                    break;
                 }
             }
         }
@@ -126,7 +126,9 @@ class NonLinearSolver {
         tf.createZeroField( FieldName::DEPL_CELLS, m_msh, m_degree_infos );
         tf.createZeroField( FieldName::DEPL_FACES, m_msh, m_degree_infos );
         if ( m_rp.isUnsteady() ) {
+            tf.createZeroField( FieldName::VITE, m_msh, m_degree_infos );
             tf.createZeroField( FieldName::VITE_CELLS, m_msh, m_degree_infos );
+            tf.createZeroField( FieldName::ACCE, m_msh, m_degree_infos );
             tf.createZeroField( FieldName::ACCE_CELLS, m_msh, m_degree_infos );
         }
         m_fields.setCurrentTimeField( tf );
@@ -217,6 +219,85 @@ class NonLinearSolver {
         return eval( x, phi );
     }
 
+    auto
+    _eval_stress( const int cell_id, const point_type &pt ) {
+
+        // stress
+        const auto cl = m_msh[cell_id];
+        const auto di = m_degree_infos.cellDegreeInfo( m_msh, cl );
+        const auto stress = m_behavior.projectStressOnCell( m_msh, cl, di.grad_degree() );
+
+        const auto gb = make_matrix_monomial_basis( m_msh, cl, di.grad_degree() );
+        const auto gphi = gb.eval_functions( pt );
+        const auto GT_iqn = eval( stress, gphi );
+
+        static_vector< scalar_type, mesh_type::dimension > sdiag, sshea;
+
+        if constexpr ( mesh_type::dimension == 2 ) {
+            sdiag( 0 ) = GT_iqn( 0, 0 );
+            sdiag( 1 ) = GT_iqn( 1, 1 );
+            sshea( 0 ) = 0.0;
+            sshea( 1 ) = GT_iqn( 0, 1 );
+        } else {
+            sdiag( 0 ) = GT_iqn( 0, 0 );
+            sdiag( 1 ) = GT_iqn( 1, 1 );
+            sdiag( 2 ) = GT_iqn( 2, 2 );
+            sshea( 0 ) = GT_iqn( 0, 1 );
+            sshea( 1 ) = GT_iqn( 0, 2 );
+            sshea( 2 ) = GT_iqn( 1, 2 );
+        }
+
+        return std::make_pair( sdiag, sshea );
+    }
+
+    void
+    _setInitialState() {
+        const bool small_def = m_behavior.getDeformation() == SMALL_DEF;
+        const auto depl = m_fields.getField( 0, FieldName::DEPL );
+
+        for ( auto &cl : m_msh ) {
+            const auto c_id = m_msh.lookup( cl );
+            const auto di = m_degree_infos.cellDegreeInfo( m_msh, cl );
+
+            const auto uTF = depl.at( c_id );
+            matrix_type gr;
+            if ( m_rp.m_precomputation ) {
+                gr = m_data.m_gradient_precomputed.at( c_id );
+            } else {
+                if ( small_def ) {
+                    gr = make_matrix_hho_symmetric_gradrec( m_msh, cl, m_degree_infos ).first;
+                } else {
+                    gr = make_matrix_hho_gradrec( m_msh, cl, m_degree_infos ).first;
+                }
+            }
+
+            const vector_type GTuTF = gr * uTF;
+
+            const auto gb = make_matrix_monomial_basis( m_msh, cl, di.grad_degree() );
+            const auto gbs = make_sym_matrix_monomial_basis( m_msh, cl, di.grad_degree() );
+
+            // Loop on nodes
+            const auto nb_qp = m_behavior.numberOfQP( c_id );
+            eigen_compatible_stdvector<
+                static_matrix< scalar_type, mesh_type::dimension, mesh_type::dimension > >
+                gphi;
+
+            for ( int i_qp = 0; i_qp < nb_qp; i_qp++ ) {
+                const auto qp = m_behavior.quadrature_point( c_id, i_qp );
+
+                if ( small_def ) {
+                    gphi = gbs.eval_functions( qp.point() );
+                } else {
+                    gphi = gb.eval_functions( qp.point() );
+                }
+
+                const auto GkT_iqn = eval( GTuTF, gphi );
+
+                m_behavior.setInitialElasticStrain( c_id, i_qp, GkT_iqn );
+            }
+        }
+    }
+
   public:
     NonLinearSolver( const mesh_type &msh, const bnd_type &bnd, const param_type &rp )
         : m_msh( msh ),
@@ -302,8 +383,6 @@ class NonLinearSolver {
         m_fields.createField( 0, FieldName::DEPL, m_msh, m_degree_infos, func );
         m_fields.createField( 0, FieldName::DEPL_CELLS, m_msh, m_degree_infos, func );
         m_fields.createField( 0, FieldName::DEPL_FACES, m_msh, m_degree_infos, func );
-
-        /*TODO: look for contact.*/
     }
 
     /**
@@ -315,6 +394,12 @@ class NonLinearSolver {
         if ( name == FieldName::DEPL ) {
             m_fields.createField( 0, FieldName::DEPL_CELLS, m_msh, m_degree_infos, func );
             m_fields.createField( 0, FieldName::DEPL_FACES, m_msh, m_degree_infos, func );
+        }
+        if ( name == FieldName::VITE ) {
+            m_fields.createField( 0, FieldName::VITE_CELLS, m_msh, m_degree_infos, func );
+        }
+        if ( name == FieldName::ACCE ) {
+            m_fields.createField( 0, FieldName::ACCE_CELLS, m_msh, m_degree_infos, func );
         }
         m_fields.createField( 0, name, m_msh, m_degree_infos, func );
     }
@@ -463,6 +548,7 @@ class NonLinearSolver {
         if ( m_rp.isUnsteady() ) {
             reformulation_dynamic( m_rp );
             m_rp.m_dyna_para["rho"] = m_behavior.getMaterialData().getRho();
+            _setInitialState();
         }
 
         // save first state;
@@ -485,9 +571,9 @@ class NonLinearSolver {
             }
 
             // stress tensor
-            const auto vzero = static_vector< scalar_type, mesh_type::dimension >::Zero();
-            vals.push_back( vzero );
-            vals.push_back( vzero );
+            const auto [sdiag, sshea] = _eval_stress( ppt.getCellId(), ppt.getPoint() );
+            vals.push_back( sdiag );
+            vals.push_back( sshea );
 
             ppt.addValues( 0.0, 0, vals );
         }
@@ -495,6 +581,9 @@ class NonLinearSolver {
         SolverInfo si;
         ppt_type stat;
         stat.setFilename( "statistics.csv" );
+
+        ppt_type energy_ppt;
+        energy_ppt.setFilename( "energy.csv" );
 
         timecounter ttot;
         ttot.tic();
@@ -514,6 +603,10 @@ class NonLinearSolver {
                 ListOfTimeStep< scalar_type >( m_rp.m_time_step, m_rp.m_user_end_time );
         else
             list_time_step = ListOfTimeStep< scalar_type >( m_rp.m_time_step );
+
+        if ( m_rp.isUnsteady() ) {
+            list_time_step.checkConstantTimeStep();
+        }
 
         if ( m_verbose )
             std::cout << "** Number of time step: " << list_time_step.numberOfTimeStep()
@@ -563,7 +656,7 @@ class NonLinearSolver {
             //  Newton correction
             si.updateInfo( newton_info );
 
-            if ( m_verbose ) {
+            if ( m_verbose and m_rp.getNonLinearSolver() != NonLinearSolverType::EXPLICIT ) {
                 newton_info.printInfo();
             }
 
@@ -648,30 +741,7 @@ class NonLinearSolver {
                     }
 
                     // stress
-                    const auto cl = *std::next( m_msh.cells_begin(), ppt.getCellId() );
-                    const auto di = m_degree_infos.cellDegreeInfo( m_msh, cl );
-                    const auto stress =
-                        m_behavior.projectStressOnCell( m_msh, cl, di.grad_degree() );
-
-                    const auto gb = make_matrix_monomial_basis( m_msh, cl, di.grad_degree() );
-                    const auto gphi = gb.eval_functions( ppt.getPoint() );
-                    const auto GT_iqn = eval( stress, gphi );
-
-                    static_vector< scalar_type, mesh_type::dimension > sdiag, sshea;
-
-                    if constexpr ( mesh_type::dimension == 2 ) {
-                        sdiag( 0 ) = GT_iqn( 0, 0 );
-                        sdiag( 1 ) = GT_iqn( 1, 1 );
-                        sshea( 0 ) = 0.0;
-                        sshea( 1 ) = GT_iqn( 0, 1 );
-                    } else {
-                        sdiag( 0 ) = GT_iqn( 0, 0 );
-                        sdiag( 1 ) = GT_iqn( 1, 1 );
-                        sdiag( 2 ) = GT_iqn( 2, 2 );
-                        sshea( 0 ) = GT_iqn( 0, 1 );
-                        sshea( 1 ) = GT_iqn( 0, 2 );
-                        sshea( 2 ) = GT_iqn( 1, 2 );
-                    }
+                    const auto [sdiag, sshea] = _eval_stress( ppt.getCellId(), ppt.getPoint() );
                     vals.push_back( sdiag );
                     vals.push_back( sshea );
 
@@ -680,6 +750,19 @@ class NonLinearSolver {
 
                 // Update stats
                 stat.addValues( current_time, newton_info.getValues() );
+
+                // Discrete HHO energy
+                if ( m_rp.isUnsteady() ) {
+                    const auto E = compute_discrete_energy();
+                    std::map< std::string, double > emap;
+                    emap["kinetic"] = E.kinetic;
+                    emap["elastic"] = E.elastic;
+                    emap["stab"] = E.stab;
+                    emap["contact"] = E.contact;
+                    emap["friction"] = E.friction;
+                    emap["total"] = E.total();
+                    energy_ppt.addValues( current_time, emap );
+                }
             }
         }
 
@@ -687,6 +770,7 @@ class NonLinearSolver {
             ppt.write();
         }
         stat.write();
+        energy_ppt.write();
 
         si.m_time_step = list_time_step.numberOfTimeStep();
 
@@ -831,6 +915,96 @@ class NonLinearSolver {
         }
 
         return std::sqrt( err_dof );
+    }
+
+    // ======================================
+    // Discrete HHO mechanical energy
+    // Kinetic = 1/2 sum_T v^T M_T v
+    // Elastic = 1/2 sum_T int_T sigma(u):eps(u),  eps = sym reconstructed gradient
+    // stab    = 1/2 sum_T beta_s (S_T u_TF, u_TF)   (HHO stabilization)
+    // ======================================
+
+    struct DiscreteEnergy {
+        scalar_type kinetic = 0;
+        scalar_type elastic = 0;
+        scalar_type stab = 0;
+        scalar_type contact = 0;   // Nitsche contact energy (normal Signorini part)
+        scalar_type friction = 0;  // Nitsche friction energy (tangential part)
+        scalar_type total() const { return kinetic + elastic + stab + contact + friction; }
+    };
+
+    DiscreteEnergy compute_discrete_energy() const {
+        DiscreteEnergy E;
+
+        const auto depl = m_fields.getCurrentField( FieldName::DEPL );
+
+        const bool have_vite = m_rp.isUnsteady();
+        std::vector< vector_type > vite;
+        if ( have_vite )
+            vite = m_fields.getCurrentField( FieldName::VITE_CELLS );
+
+        const auto &mat = m_behavior.getMaterialData();
+        const scalar_type mu = mat.getMu();
+        const scalar_type lambda = mat.getLambda();
+        const scalar_type rho = mat.getRho();
+
+        for ( auto &cl : m_msh ) {
+            const auto cell_i = m_msh.lookup( cl );
+            const auto di = m_degree_infos.cellDegreeInfo( m_msh, cl );
+
+            const auto cb = make_vector_monomial_basis( m_msh, cl, di.cell_degree() );
+            const vector_type uTF = depl.at( cell_i );
+
+            // --- kinetic: 1/2 v_T^T M_T v_T ---
+            if ( have_vite ) {
+                const matrix_type MT = rho * make_mass_matrix( m_msh, cl, cb );
+                const vector_type vT = vite.at( cell_i );
+                E.kinetic += scalar_type( 0.5 ) * vT.dot( MT * vT );
+            }
+
+            // --- elastic strain energy (small strain, linear elasticity) ---
+            if ( m_behavior.getDeformation() == SMALL_DEF ) {
+                matrix_type gr;
+                if ( m_rp.m_precomputation )
+                    gr = m_data.m_gradient_precomputed.at( cell_i );
+                else
+                    gr = make_matrix_hho_symmetric_gradrec( m_msh, cl, m_degree_infos ).first;
+
+                const vector_type GTuTF = gr * uTF;
+                const auto gbs = make_sym_matrix_monomial_basis( m_msh, cl, di.grad_degree() );
+
+                const auto qps = integrate( m_msh, cl, 2 * di.grad_degree() + 1 );
+                for ( auto &qp : qps ) {
+                    const auto gphi = gbs.eval_functions( qp.point() );
+                    const auto eps = eval( GTuTF, gphi );   // symmetric strain tensor at qp
+                    const scalar_type tr = eps.trace();
+                    E.elastic += qp.weight() *
+                                 ( mu * eps.squaredNorm() + scalar_type( 0.5 ) * lambda * tr * tr );
+                }
+            }
+
+            // stabilization energy
+            if ( m_rp.m_stab ) {
+                const matrix_type ST =
+                    _stab( m_msh, cl, m_rp, m_degree_infos, m_data.m_stab_precomputed );
+                const scalar_type beta_s = m_stab_manager.getValue( m_msh, cl );
+                E.stab += scalar_type( 0.5 ) * beta_s * uTF.dot( ST * uTF );
+            }
+
+            // // --- Nitsche contact energy (normal Signorini part) ---
+            if ( m_behavior.getDeformation() == SMALL_DEF && m_bnd.cell_has_contact_faces( cl ) ) {
+                matrix_type gr_c;
+                if ( m_rp.m_precomputation )
+                    gr_c = m_data.m_gradient_precomputed.at( cell_i );
+                else
+                    gr_c = make_matrix_hho_symmetric_gradrec( m_msh, cl, m_degree_infos ).first;
+
+                auto cc = contact_contribution< mesh_type >( m_msh, mat, m_rp, m_bnd );
+                E.contact += cc.nitsche_contact_energy( cl, di, gr_c, uTF );
+                E.friction += cc.nitsche_friction_energy( cl, di, gr_c, uTF );
+            }
+        }
+        return E;
     }
 
     void output_discontinuous_field( const std::string &filename, FieldName name ) const {

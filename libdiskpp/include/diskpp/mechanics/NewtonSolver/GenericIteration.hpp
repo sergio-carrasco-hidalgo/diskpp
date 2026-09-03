@@ -145,6 +145,8 @@ class GenericIteration {
         m_assembler = assembler_type( msh, degree_infos, bnd );
     }
 
+    virtual ~GenericIteration() = default;
+
     bool verbose( void ) const { return m_verbose; }
 
     void verbose( bool v ) { m_verbose = v; }
@@ -210,6 +212,14 @@ class GenericIteration {
 
         // norm of the rhs
         const scalar_type residual = m_assembler.RHS.norm();
+
+        // The reference residual of the step is recorded before any of the robustness
+        // checks below, so that the relative stopping criterion is always anchored on the
+        // residual this step actually started from.
+        if ( iter == 0 ) {
+            this->m_resi_init = residual;
+        }
+
         scalar_type max_error = 0.0;
         for ( size_t i = 0; i < m_assembler.RHS.size(); i++ ) {
             max_error = std::max( max_error, std::abs( m_assembler.RHS( i ) ) );
@@ -226,7 +236,7 @@ class GenericIteration {
             relative_displ = error_incr / norm_sol;
         }
 
-        if ( m_verbose ) {
+        if ( m_verbose and rp.getNonLinearSolver() != NonLinearSolverType::EXPLICIT ) {
             std::string s_iter = "   " + std::to_string( iter ) + "               ";
             s_iter.resize( 9 );
 
@@ -268,19 +278,22 @@ class GenericIteration {
             throw std::runtime_error( "Norm of residual is too large." );
         }
 
-        if ( iter == 0 ) {
-            this->m_resi_init = residual;
-        }
-
         if ( residual > 1e10 * this->m_resi_init ) {
             throw std::runtime_error( "Norm of residual diverges." );
         }
 
-        if ( error <= rp.getConvergenceCriteria() ) {
+        // Mixed stopping criterion anchored on the initial residual of the step: converge
+        // either when the residual has dropped by the requested factor or when it is small
+        // in absolute terms. The absolute test also catches a step that starts at rest,
+        // where the relative test would never be satisfiable.
+        const scalar_type eps = rp.getConvergenceCriteria();
+        const scalar_type abs_tol = scalar_type( 1e-9 );
+
+        if ( this->m_resi_init <= abs_tol ) {
             return true;
-        } else {
-            return false;
         }
+
+        return residual <= eps * this->m_resi_init || residual <= abs_tol;
     }
 
     virtual scalar_type post_convergence( const mesh_type &msh, const bnd_type &bnd,
