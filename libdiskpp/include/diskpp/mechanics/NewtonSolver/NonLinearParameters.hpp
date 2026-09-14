@@ -300,9 +300,7 @@ class NonLinearParameters {
     std::map< std::string, T > m_dyna_para; // list of parameters
     T m_cfl_factor;                         // CFL factor
 
-    // Impose the contact condition on the cell trace (SIGNORINI_CELL) instead of the
-    // face unknowns (SIGNORINI_FACE).
-    bool m_contact_cell;
+    bool m_contact_cell; // SIGNORINI_CELL (cell trace) instead of SIGNORINI_FACE
 
 
     int m_n_time_save;          // number of saving
@@ -310,15 +308,13 @@ class NonLinearParameters {
 
     T m_theta;                // theta-parameter for contact
     T m_gamma_0;              // parameter for Nitsche
-    // Tangential Nitsche penalty. Negative means 'not set': gamma_0_t() then falls
-    // back to m_gamma_0. The velocity-based friction law needs a much smaller value
-    // than the normal condition, so the two are separate.
-    T m_gamma_0_t = T( -1 );
-    // Regularisation of the sliding direction in the friction projection: x/|x| becomes
-    // x/sqrt(|x|^2 + eps^2). The exact direction flips sign whenever the sliding reverses.
-    // 0 = exact, non-smooth law.
-    T m_dproj_eps = T( 0 );
-    T m_threshold;            // threshol for Tesca friction
+    T m_gamma_0_t = T( -1 ); // tangential penalty, < 0 = use m_gamma_0
+    T m_threshold;            // threshol for Tesca friction // F from Coulomb friction
+
+    // Coulomb tangent: include d(friction bound)/du, the term coupling the tangential
+    // projection to the normal pressure. Consistent, but it makes Newton cycle at contact
+    // still needed to fix it
+    bool m_consistent_friction_tangent = true;
     FrictionType m_frot_type; // Friction type ?
 
     solvers::direct_solver m_lin_solv;    // linear solver
@@ -346,7 +342,7 @@ class NonLinearParameters {
           m_threshold( 0 ),
           m_frot_type( FrictionType::NO_FRICTION ),
           m_dyna_type( DynamicType::STATIC ),
-          m_contact_cell( false ),
+          m_contact_cell( false ), // default: face version
           m_lin_solv( solvers::direct_solver::autosel ),
           m_nlin_solv( NonLinearSolverType::NEWTON ),
           m_lsearch( LineSearchType::NO_LS ),
@@ -385,9 +381,12 @@ class NonLinearParameters {
                   << std::endl;
         std::cout << " - Friction ?: " << FrictionName( m_frot_type ) << std::endl;
         std::cout << " - Threshold: " << m_threshold << std::endl;
+        std::cout << " - FrictionTangent: "
+                  << ( m_consistent_friction_tangent ? "CONSISTENT"
+                                                     : "FROZEN_BOUND" )
+                  << std::endl;
         std::cout << " - Gamma_0: " << m_gamma_0 << std::endl;
         std::cout << " - Gamma_0_t: " << gamma_0_t() << std::endl;
-        std::cout << " - SlipEps: " << m_dproj_eps << std::endl;
         std::cout << " - Theta: " << m_theta << std::endl;
     }
 
@@ -521,9 +520,6 @@ class NonLinearParameters {
             } else if ( keyword == "Gamma0T" ) {
                 ifs >> m_gamma_0_t;
                 line++;
-            } else if ( keyword == "SlipEps" ) {
-                ifs >> m_dproj_eps;
-                line++;
             } else if ( keyword == "Friction" ) {
                 std::string type;
                 ifs >> type;
@@ -538,6 +534,17 @@ class NonLinearParameters {
                     error_keyword(line, keyword, type);
             } else if ( keyword == "Threshold" ) {
                 ifs >> m_threshold;
+                line++;
+            } else if ( keyword == "FrictionTangent" ) {
+                std::string type;
+                ifs >> type;
+                line++;
+                if ( type == "CONSISTENT" )
+                    m_consistent_friction_tangent = true;
+                else if ( type == "FROZEN_BOUND" )
+                    m_consistent_friction_tangent = false;
+                else
+                    error_keyword( line, keyword, type );
             } else if ( keyword == "Dynamic" ) {
                 std::string type;
                 ifs >> type;
@@ -649,10 +656,12 @@ class NonLinearParameters {
 
     auto getUnsteadyParameters() const { return m_dyna_para; }
 
-    // dv/du of the time integrator: every scheme writes v_{n+1} affinely in u_{n+1}.
-    // Tangential penalty; defaults to the normal one when Gamma0T is absent.
+    // tangential penalty, falling back on m_gamma_0 when Gamma0T is absent
     T gamma_0_t() const { return m_gamma_0_t > T( 0 ) ? m_gamma_0_t : m_gamma_0; }
 
+    bool consistentFrictionTangent() const { return m_consistent_friction_tangent; }
+
+    // dv/du of the time integrator
     T velocity_slope( const T dt ) const {
         switch ( m_dyna_type ) {
         case DynamicType::STATIC:
@@ -664,8 +673,7 @@ class NonLinearParameters {
             // v = theta*dt * a  and  a = u/(theta^2*dt^2)  ==>  1/(theta*dt)
             return T( 1 ) / ( m_dyna_para.at( "theta" ) * dt );
         default:
-            // BACKWARD_EULER / CRANK_NICOLSON are rewritten as THETA before use, so this
-            // is the LEAP_FROG case.
+            // LEAP_FROG; BACKWARD_EULER and CRANK_NICOLSON are rewritten as THETA
             return T( 1 ) / dt;
         }
     }
