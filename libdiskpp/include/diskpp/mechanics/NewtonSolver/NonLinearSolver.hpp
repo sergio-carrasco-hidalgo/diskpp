@@ -704,6 +704,9 @@ class NonLinearSolver {
                     this->output_stabCoeff( name + "stabCoeff.msh" );
                     this->output_equivalentPlasticStrain_GP( name +
                                                              "equivalentPlasticStrain_GP.msh" );
+                    if ( m_bnd.nb_faces_contact() > 0 ) {
+                        this->output_contact_boundary( name + "contact.csv" );
+                    }
                     if ( m_rp.isUnsteady() ) {
                         this->output_discontinuous_field( name + "vite_disc.msh",
                                                           FieldName::VITE_CELLS );
@@ -917,19 +920,15 @@ class NonLinearSolver {
         return std::sqrt( err_dof );
     }
 
-    // ======================================
-    // Discrete HHO mechanical energy
-    // Kinetic = 1/2 sum_T v^T M_T v
-    // Elastic = 1/2 sum_T int_T sigma(u):eps(u),  eps = sym reconstructed gradient
-    // stab    = 1/2 sum_T beta_s (S_T u_TF, u_TF)   (HHO stabilization)
-    // ======================================
+    // discrete HHO mechanical energy: 1/2 sum_T [ v^T M_T v + int_T sigma(u):eps(u)
+    // + beta_s (S_T u_TF, u_TF) ], plus the Nitsche contact and friction terms
 
     struct DiscreteEnergy {
         scalar_type kinetic = 0;
         scalar_type elastic = 0;
         scalar_type stab = 0;
-        scalar_type contact = 0;   // Nitsche contact energy (normal Signorini part)
-        scalar_type friction = 0;  // Nitsche friction energy (tangential part)
+        scalar_type contact = 0;  // Nitsche, normal Signorini part
+        scalar_type friction = 0; // Nitsche, tangential part
         scalar_type total() const { return kinetic + elastic + stab + contact + friction; }
     };
 
@@ -955,14 +954,14 @@ class NonLinearSolver {
             const auto cb = make_vector_monomial_basis( m_msh, cl, di.cell_degree() );
             const vector_type uTF = depl.at( cell_i );
 
-            // --- kinetic: 1/2 v_T^T M_T v_T ---
+            // kinetic
             if ( have_vite ) {
                 const matrix_type MT = rho * make_mass_matrix( m_msh, cl, cb );
                 const vector_type vT = vite.at( cell_i );
                 E.kinetic += scalar_type( 0.5 ) * vT.dot( MT * vT );
             }
 
-            // --- elastic strain energy (small strain, linear elasticity) ---
+            // elastic strain energy (small strain)
             if ( m_behavior.getDeformation() == SMALL_DEF ) {
                 matrix_type gr;
                 if ( m_rp.m_precomputation )
@@ -976,7 +975,7 @@ class NonLinearSolver {
                 const auto qps = integrate( m_msh, cl, 2 * di.grad_degree() + 1 );
                 for ( auto &qp : qps ) {
                     const auto gphi = gbs.eval_functions( qp.point() );
-                    const auto eps = eval( GTuTF, gphi );   // symmetric strain tensor at qp
+                    const auto eps = eval( GTuTF, gphi );
                     const scalar_type tr = eps.trace();
                     E.elastic += qp.weight() *
                                  ( mu * eps.squaredNorm() + scalar_type( 0.5 ) * lambda * tr * tr );
@@ -991,7 +990,7 @@ class NonLinearSolver {
                 E.stab += scalar_type( 0.5 ) * beta_s * uTF.dot( ST * uTF );
             }
 
-            // // --- Nitsche contact energy (normal Signorini part) ---
+            // Nitsche contact and friction energy
             if ( m_behavior.getDeformation() == SMALL_DEF && m_bnd.cell_has_contact_faces( cl ) ) {
                 matrix_type gr_c;
                 if ( m_rp.m_precomputation )
@@ -1005,6 +1004,91 @@ class NonLinearSolver {
             }
         }
         return E;
+    }
+
+    // Trace of the whole contact boundary at the current time, one row per contact
+    // quadrature point, ordered along the boundary. Every tangential quantity is
+    // projected on the tangent of the face's own discrete normal, never on a fixed axis.
+    void output_contact_boundary( const std::string &filename ) const {
+        if constexpr ( mesh_type::dimension != 2 ) {
+            std::cout << "output_contact_boundary: 2D only, skipped" << std::endl;
+            return;
+        } else {
+            typedef typename contact_contribution< mesh_type >::trace_point trace_point;
+
+            const auto depl = m_fields.getCurrentField( FieldName::DEPL );
+            const auto &mat = m_behavior.getMaterialData();
+
+            std::vector< trace_point > rows;
+
+            int cell_i = 0;
+            for ( auto &cl : m_msh ) {
+                if ( m_bnd.cell_has_contact_faces( cl ) ) {
+                    const auto di = m_degree_infos.cellDegreeInfo( m_msh, cl );
+                    const vector_type uTF = depl.at( cell_i );
+
+                    matrix_type gr;
+                    if ( m_rp.m_precomputation )
+                        gr = m_data.m_gradient_precomputed.at( cell_i );
+                    else
+                        gr = make_matrix_hho_symmetric_gradrec( m_msh, cl, m_degree_infos ).first;
+
+                    auto cc = contact_contribution< mesh_type >( m_msh, mat, m_rp, m_bnd );
+                    const auto tr = cc.contact_boundary_trace( cl, di, gr, uTF );
+                    rows.insert( rows.end(), tr.begin(), tr.end() );
+                }
+                cell_i++;
+            }
+
+            // order along the boundary
+            std::sort( rows.begin(), rows.end(), []( const trace_point &a, const trace_point &b ) {
+                if ( a.pt.x() != b.pt.x() )
+                    return a.pt.x() < b.pt.x();
+                return a.pt.y() < b.pt.y();
+            } );
+
+            const scalar_type nan = std::numeric_limits< scalar_type >::quiet_NaN();
+
+            std::ofstream ofs( filename );
+            ofs << std::setprecision( 12 );
+            ofs << "x,y,x_def,y_def,nx,ny,tx,ty,w,gap0,gap,u_n,u_t,ux,uy,"
+                << "sigma_nn,sigma_nt,abs_sigma_nt,Fc,coulomb_limit,stress_ratio,"
+                << "phi_n,phi_t,fric_bound,nitsche_ratio,state\n";
+
+            for ( const auto &r : rows ) {
+                const scalar_type tx = -r.n( 1 );
+                const scalar_type ty = r.n( 0 );
+                const scalar_type gap = r.gap0 - r.u_n;
+
+                const scalar_type coulomb_limit =
+                    r.Fc * std::max( scalar_type( 0 ), -r.sigma_nn );
+                const scalar_type stress_ratio =
+                    coulomb_limit > scalar_type( 0 ) ? std::abs( r.sigma_nt ) / coulomb_limit : nan;
+                const scalar_type nitsche_ratio =
+                    r.fric_bound > scalar_type( 0 ) ? std::abs( r.phi_t ) / r.fric_bound : nan;
+
+                std::string state;
+                if ( r.phi_n >= scalar_type( 0 ) )
+                    state = "SEP";
+                else if ( std::abs( r.phi_t ) > r.fric_bound )
+                    state = "SLIP";
+                else
+                    state = "STICK";
+
+                ofs << r.pt.x() << "," << r.pt.y() << "," << r.pt.x() + r.u( 0 ) << ","
+                    << r.pt.y() + r.u( 1 ) << "," << r.n( 0 ) << "," << r.n( 1 ) << "," << tx << ","
+                    << ty << "," << r.weight << "," << r.gap0 << "," << gap << "," << r.u_n << ","
+                    << r.u_t << "," << r.u( 0 ) << "," << r.u( 1 ) << "," << r.sigma_nn << ","
+                    << r.sigma_nt << "," << std::abs( r.sigma_nt ) << "," << r.Fc << ","
+                    << coulomb_limit << "," << stress_ratio << "," << r.phi_n << "," << r.phi_t
+                    << "," << r.fric_bound << "," << nitsche_ratio << "," << state << "\n";
+            }
+            ofs.close();
+
+            if ( m_verbose )
+                std::cout << "** contact boundary trace: " << rows.size() << " points -> "
+                          << filename << std::endl;
+        }
     }
 
     void output_discontinuous_field( const std::string &filename, FieldName name ) const {
